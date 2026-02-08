@@ -5,7 +5,7 @@
 
 String nxBuf = "";
 unsigned long nxLastMs = 0;
-const unsigned long NX_TIMEOUT_MS = 80; // kdy vyhodnotit "zprávu"
+const unsigned long NX_TIMEOUT_MS = 80;
 
 // piny robota
 const int buttonPin = 45;
@@ -16,10 +16,19 @@ const int sensorPins[8] = { 22, 23, 24, 25, 26, 27, 28, 29 };
 // nastaveni rychlosti
 const int SPEED_STRAIGHT = 140;
 const int SPEED_TURN     = 210;
-const int SPEED_SLOW     = 70;
+const int SPEED_SLOW     = 50;
 
+// prekazky
 const int STOP_CM   = 15;
 const int RESUME_CM = 20;
+
+// ===== „drž odstup“ (regulátor) =====
+const int TARGET_CM     = 15;
+const int DEAD_CM       = 1;      // malá mrtvá zóna
+const int MIN_BLOCK_SPD = 110;    // minimum, aby se to fakt hnulo (zvyš klidně 120–140)
+const int MAX_BLOCK_SPD = 200;    // max rychlost v blocked
+const float KP          = 12.0;   // síla reakce (zvyš 12->18 pokud je to líné)
+const int BLOCK_LOOP_MS = 60;     // jak často řídit (50–80)
 
 const bool LINE_IS_LOW = false;
 
@@ -45,7 +54,7 @@ void setup() {
   for (int i = 0; i < 8; i++) pinMode(sensorPins[i], INPUT_PULLUP);
 
   stopMotors();
-  Serial.println("MK1 READY (HW toggle + NX: a=start, a2=kill)");
+  Serial.println("MK1 READY");
 }
 
 void loop() {
@@ -58,32 +67,66 @@ void loop() {
     return;
   }
 
-  long d = distanceCM();
+  long d = distanceCMAvg(5);   // víc průměrování -> stabilnější (3..7)
 
+  // ===== vstup do blocked =====
   if (!blocked) {
     if (d > 0 && d < STOP_CM) {
       blocked = true;
       stopMotors();
-      Serial.println("BLOCKED: obstacle");
-      delay(50);
-      return;
-    }
-  } else {
-    if (d < 0 || d > RESUME_CM) {
-      blocked = false;
-      Serial.println("RESUME: obstacle gone");
-      delay(50);
-    } else {
-      stopMotors();
-      delay(50);
+      Serial.println("BLOCKED");
+      delay(80);
       return;
     }
   }
 
+  // ===== blocked: konstantní regulace vzdálenosti =====
+  if (blocked) {
+    if (d < 0) {
+      // nic nezměřil -> drž bezpečně STOP
+      stopMotors();
+      delay(BLOCK_LOOP_MS);
+      return;
+    }
+
+    // překážka zmizela -> zpět na čáru
+    if (d > RESUME_CM) {
+      blocked = false;
+      stopMotors();
+      Serial.println("RESUME");
+      delay(80);
+      // pokračujeme na followLine()
+    } else {
+      // error: + = ruka daleko -> vpřed, - = ruka blízko -> vzad
+      int e = (int)(d - TARGET_CM);
+
+      if (abs(e) <= DEAD_CM) {
+        stopMotors();
+      } else {
+        int spd = (int)(MIN_BLOCK_SPD + KP * abs(e));
+        if (spd > MAX_BLOCK_SPD) spd = MAX_BLOCK_SPD;
+
+        if (e > 0) driveForwardAt(spd);
+        else       driveBackwardAt(spd);
+      }
+
+      // debug (ať vidíš, že to fakt dělá příkazy)
+      Serial.print("d=");
+      Serial.print(d);
+      Serial.print("  e=");
+      Serial.print(e);
+      Serial.println();
+
+      delay(BLOCK_LOOP_MS);
+      return; // v blocked NEJEZDI line-follow
+    }
+  }
+
+  // ===== normální režim =====
   followLine();
 }
 
-// hw toggle tlacitko (pojistka vedle displeje)
+// hw toggle tlacitko
 void handleButton() {
   bool s = digitalRead(buttonPin);
 
@@ -91,26 +134,22 @@ void handleButton() {
     running = !running;
     blocked = false;
     stopMotors();
-    Serial.println(running ? "START (HW)" : "STOP (HW)");
+    Serial.println(running ? "START(HW)" : "STOP(HW)");
     delay(200);
   }
 
   lastButton = s;
 }
 
-// Nextion displej
-// "a"  => start
-// "a2" => kill switch
+// Nextion displej: "a" start, "a2" kill
 void handleNextion() {
   while (NX.available()) {
     char c = (char)NX.read();
-
-    if ((uint8_t)c == 0xFF) continue;     // ignoruj terminátory
-    if (c == '\r' || c == '\n') continue; // ignoruj CR/LF
+    if ((uint8_t)c == 0xFF) continue;
+    if (c == '\r' || c == '\n') continue;
 
     nxBuf += c;
     nxLastMs = millis();
-
     if (nxBuf.length() > 30) nxBuf.remove(0, 10);
   }
 
@@ -119,28 +158,25 @@ void handleNextion() {
     msg.trim();
     nxBuf = "";
 
-    // priorita: a2 (kill) musí mít přednost před a
     if (msg.indexOf("a2") != -1) {
       running = false;
       blocked = false;
       stopMotors();
-      Serial.println("KILL (NX a2)");
+      Serial.println("KILL(NX)");
       return;
     }
-
 
     if (msg.indexOf("a") != -1) {
       running = true;
       blocked = false;
       stopMotors();
-      Serial.println("START (NX a)");
+      Serial.println("START(NX)");
       return;
     }
-
   }
 }
 
-// ultrazvukový senzor
+// ultrazvuk
 long distanceCM() {
   digitalWrite(trigPin, LOW);
   delayMicroseconds(2);
@@ -153,20 +189,34 @@ long distanceCM() {
   return (long)(t * 0.034 / 2);
 }
 
-// ir senzor
+long distanceCMAvg(int n) {
+  long sum = 0;
+  int cnt = 0;
+
+  for (int i = 0; i < n; i++) {
+    long d = distanceCM();
+    if (d > 0) { sum += d; cnt++; }
+    delay(10);
+  }
+
+  if (cnt == 0) return -1;
+  return sum / cnt;
+}
+
+// ir helper
 bool seesLine(int i) {
   int v = digitalRead(sensorPins[i]);
   return LINE_IS_LOW ? (v == LOW) : (v == HIGH);
 }
 
-// ir senzor 2
+// line follow
 void followLine() {
   bool L = seesLine(0) || seesLine(1) || seesLine(2);
   bool C = seesLine(3) || seesLine(4);
   bool R = seesLine(5) || seesLine(6) || seesLine(7);
 
   if (C && !L && !R) {
-    driveForward();
+    driveForwardAt(SPEED_STRAIGHT);
     lastTurn = 0;
   } else if (L && !R) {
     turnLeft();
@@ -175,7 +225,7 @@ void followLine() {
     turnRight();
     lastTurn = +1;
   } else if (L && C && R) {
-    driveForward();
+    driveForwardAt(SPEED_STRAIGHT);
     lastTurn = 0;
   } else {
     if (lastTurn == -1) turnLeft();
@@ -184,12 +234,19 @@ void followLine() {
   }
 }
 
-// motory
-void driveForward() {
-  motorL.setSpeed(SPEED_STRAIGHT);
-  motorR.setSpeed(SPEED_STRAIGHT);
+// ===== nové: jízda s danou rychlostí =====
+void driveForwardAt(int spd) {
+  motorL.setSpeed(spd);
+  motorR.setSpeed(spd);
   motorL.run(LEFT_REVERSED ? BACKWARD : FORWARD);
   motorR.run(RIGHT_REVERSED ? BACKWARD : FORWARD);
+}
+
+void driveBackwardAt(int spd) {
+  motorL.setSpeed(spd);
+  motorR.setSpeed(spd);
+  motorL.run(LEFT_REVERSED ? FORWARD : BACKWARD);
+  motorR.run(RIGHT_REVERSED ? FORWARD : BACKWARD);
 }
 
 void turnLeft() {

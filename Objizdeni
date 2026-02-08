@@ -1,0 +1,451 @@
+#include <AFMotor.h>
+
+// Nextion displej
+#define NX Serial1
+String nxBuf = "";
+unsigned long nxLastMs = 0;
+const unsigned long NX_TIMEOUT_MS = 80;
+
+// piny robota
+const int buttonPin = 45;
+const int trigPin = 41;
+const int echoPin = 40;
+const int sensorPins[8] = { 22, 23, 24, 25, 26, 27, 28, 29 };
+
+// rychlosti
+const int SPEED_STRAIGHT = 140;
+const int SPEED_TURN     = 210;
+const int SPEED_SLOW     = 50;
+
+// prekazky
+const int STOP_CM   = 15;
+const int RESUME_CM = 20;
+
+// „drž odstup“ (regulátor)
+const int TARGET_CM     = 15;
+const int DEAD_CM       = 1;
+const int MIN_BLOCK_SPD = 110;
+const int MAX_BLOCK_SPD = 200;
+const float KP          = 12.0;
+const int BLOCK_LOOP_MS = 60;
+
+const bool LINE_IS_LOW = false;
+
+// ===== OBJÍŽDĚNÍ =====
+const unsigned long AVOID_TURN_MS      = 450;  // otočení "ven"
+const unsigned long AVOID_TURN_BACK_MS = 750;  // <<< NOVÉ: větší úhel návratu (zvyš/sniž dle reality)
+const unsigned long AVOID_DRIVE_MS     = 1500;
+const unsigned long SEARCH_TIMEOUT_MS  = 7000;
+
+const int AVOID_SPEED_TURN = 190;
+const int AVOID_SPEED_FWD  = 150;
+
+// ===== VYLEPŠENÍ SEARCH =====
+const int SEARCH_SPEED = 140;
+const int LINE_STRONG_MIN = 2;
+const unsigned long CAPTURE_DRIVE_MS = 350;
+
+// detekce přibližování překážky
+const int APPROACH_CM = 1;
+const int NOT_APPROACH_COUNT = 3;
+
+// motory
+AF_DCMotor motorL(1);
+AF_DCMotor motorR(2);
+const bool LEFT_REVERSED  = true;
+const bool RIGHT_REVERSED = false;
+
+// stavy
+bool running = false;
+bool lastButton = HIGH;
+int lastTurn = 0;
+
+// ===== režimy =====
+enum Mode {
+  MODE_LINE,
+  MODE_OBS_HOLD,
+  MODE_AVOID_TURN_OUT,
+  MODE_AVOID_DRIVE_OUT,
+  MODE_AVOID_TURN_BACK,
+  MODE_AVOID_SEARCH,
+  MODE_CAPTURE_LINE
+};
+
+Mode mode = MODE_LINE;
+unsigned long stateMs = 0;
+
+long lastDist = -1;
+int notApproachStreak = 0;
+int avoidDir = +1; // +1 = doprava, -1 = doleva
+
+// ============== SETUP ==============
+void setup() {
+  Serial.begin(9600);
+  NX.begin(9600);
+
+  pinMode(buttonPin, INPUT_PULLUP);
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+
+  for (int i = 0; i < 8; i++) pinMode(sensorPins[i], INPUT_PULLUP);
+
+  stopMotors();
+  Serial.println("MK1 READY (avoidance + improved search)");
+}
+
+// ============== LOOP ==============
+void loop() {
+  handleButton();
+  handleNextion(); // a=start, a2=kill
+
+  if (!running) {
+    stopMotors();
+    mode = MODE_LINE;
+    lastDist = -1;
+    notApproachStreak = 0;
+    return;
+  }
+
+  // měř vzdálenost jen tam, kde ji používáme
+  long d = -1;
+  if (mode == MODE_LINE || mode == MODE_OBS_HOLD) {
+    d = distanceCMAvg(5);
+  }
+
+  switch (mode) {
+
+    case MODE_LINE: {
+      if (d > 0 && d < STOP_CM) {
+        mode = MODE_OBS_HOLD;
+        stateMs = millis();
+        lastDist = d;
+        notApproachStreak = 0;
+
+        // směr objíždění podle posledního turnu
+        avoidDir = (lastTurn == -1) ? +1 : -1;
+
+        stopMotors();
+        Serial.println("OBSTACLE -> HOLD");
+        delay(50);
+        return;
+      }
+
+      followLine();
+    } break;
+
+    case MODE_OBS_HOLD: {
+      if (d < 0) {
+        stopMotors();
+        delay(BLOCK_LOOP_MS);
+        return;
+      }
+
+      if (d > RESUME_CM) {
+        mode = MODE_LINE;
+        stopMotors();
+        Serial.println("HOLD -> LINE (obstacle gone)");
+        delay(50);
+        return;
+      }
+
+      int diff = (lastDist > 0) ? (int)(d - lastDist) : 0;
+      bool approaching = (diff <= -APPROACH_CM);
+
+      if (approaching) {
+        notApproachStreak = 0;
+
+        int e = (int)(d - TARGET_CM);
+        if (abs(e) <= DEAD_CM) {
+          stopMotors();
+        } else {
+          int spd = (int)(MIN_BLOCK_SPD + KP * abs(e));
+          if (spd > MAX_BLOCK_SPD) spd = MAX_BLOCK_SPD;
+
+          if (e > 0) driveForwardAt(spd);
+          else       driveBackwardAt(spd);
+        }
+
+      } else {
+        notApproachStreak++;
+        stopMotors();
+
+        if (notApproachStreak >= NOT_APPROACH_COUNT) {
+          mode = MODE_AVOID_TURN_OUT;
+          stateMs = millis();
+          stopMotors();
+          Serial.println("HOLD -> AVOID (start maneuver)");
+          delay(50);
+          return;
+        }
+      }
+
+      lastDist = d;
+      delay(BLOCK_LOOP_MS);
+      return;
+    } break;
+
+    case MODE_AVOID_TURN_OUT: {
+      spinInPlace(avoidDir, AVOID_SPEED_TURN);
+
+      if (millis() - stateMs >= AVOID_TURN_MS) {
+        mode = MODE_AVOID_DRIVE_OUT;
+        stateMs = millis();
+        stopMotors();
+        delay(30);
+      }
+      return;
+    } break;
+
+    case MODE_AVOID_DRIVE_OUT: {
+      driveForwardAt(AVOID_SPEED_FWD);
+
+      if (millis() - stateMs >= AVOID_DRIVE_MS) {
+        mode = MODE_AVOID_TURN_BACK;
+        stateMs = millis();
+        stopMotors();
+        delay(30);
+      }
+      return;
+    } break;
+
+    case MODE_AVOID_TURN_BACK: {
+      spinInPlace(-avoidDir, AVOID_SPEED_TURN);
+
+      // <<< ZMĚNA: návrat má vlastní čas, takže větší úhel
+      if (millis() - stateMs >= AVOID_TURN_BACK_MS) {
+        mode = MODE_AVOID_SEARCH;
+        stateMs = millis();
+        stopMotors();
+        Serial.println("AVOID -> SEARCH");
+        delay(30);
+      }
+      return;
+    } break;
+
+    case MODE_AVOID_SEARCH: {
+      if (lineSeenStrong()) {
+        mode = MODE_CAPTURE_LINE;
+        stateMs = millis();
+        Serial.print("SEARCH found line, cnt=");
+        Serial.println(lineCount());
+        return;
+      }
+
+      bool L = seesLine(0) || seesLine(1) || seesLine(2);
+      bool C = seesLine(3) || seesLine(4);
+      bool R = seesLine(5) || seesLine(6) || seesLine(7);
+
+      if (C) {
+        driveForwardAt(SEARCH_SPEED);
+      } else if (L && !R) {
+        motorL.setSpeed(SEARCH_SPEED);
+        motorR.setSpeed(min(SEARCH_SPEED + 50, 255));
+        motorL.run(LEFT_REVERSED ? BACKWARD : FORWARD);
+        motorR.run(RIGHT_REVERSED ? BACKWARD : FORWARD);
+      } else if (R && !L) {
+        motorL.setSpeed(min(SEARCH_SPEED + 50, 255));
+        motorR.setSpeed(SEARCH_SPEED);
+        motorL.run(LEFT_REVERSED ? BACKWARD : FORWARD);
+        motorR.run(RIGHT_REVERSED ? BACKWARD : FORWARD);
+      } else {
+        driveForwardAt(SEARCH_SPEED);
+      }
+
+      if (millis() - stateMs >= SEARCH_TIMEOUT_MS) {
+        mode = MODE_LINE;
+        stopMotors();
+        Serial.println("SEARCH timeout -> LINE");
+        delay(50);
+        return;
+      }
+
+      delay(25);
+      return;
+    } break;
+
+    case MODE_CAPTURE_LINE: {
+      driveForwardAt(SEARCH_SPEED);
+
+      if (millis() - stateMs >= CAPTURE_DRIVE_MS) {
+        mode = MODE_LINE;
+        Serial.println("CAPTURE -> LINE");
+      }
+
+      delay(10);
+      return;
+    } break;
+  }
+}
+
+// ================== OVLÁDÁNÍ ==================
+
+void handleButton() {
+  bool s = digitalRead(buttonPin);
+
+  if (s == LOW && lastButton == HIGH) {
+    running = !running;
+    mode = MODE_LINE;
+    lastDist = -1;
+    notApproachStreak = 0;
+    stopMotors();
+    Serial.println(running ? "START(HW)" : "STOP(HW)");
+    delay(200);
+  }
+
+  lastButton = s;
+}
+
+void handleNextion() {
+  while (NX.available()) {
+    char c = (char)NX.read();
+    if ((uint8_t)c == 0xFF) continue;
+    if (c == '\r' || c == '\n') continue;
+
+    nxBuf += c;
+    nxLastMs = millis();
+    if (nxBuf.length() > 30) nxBuf.remove(0, 10);
+  }
+
+  if (nxBuf.length() > 0 && (millis() - nxLastMs) > NX_TIMEOUT_MS) {
+    String msg = nxBuf;
+    msg.trim();
+    nxBuf = "";
+
+    if (msg.indexOf("a2") != -1) {
+      running = false;
+      mode = MODE_LINE;
+      lastDist = -1;
+      notApproachStreak = 0;
+      stopMotors();
+      Serial.println("KILL(NX)");
+      return;
+    }
+
+    if (msg.indexOf("a") != -1) {
+      running = true;
+      mode = MODE_LINE;
+      lastDist = -1;
+      notApproachStreak = 0;
+      stopMotors();
+      Serial.println("START(NX)");
+      return;
+    }
+  }
+}
+
+// ================== ULTRAZVUK ==================
+
+long distanceCM() {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+
+  long t = pulseIn(echoPin, HIGH, 25000);
+  if (t == 0) return -1;
+  return (long)(t * 0.034 / 2);
+}
+
+long distanceCMAvg(int n) {
+  long sum = 0;
+  int cnt = 0;
+
+  for (int i = 0; i < n; i++) {
+    long d = distanceCM();
+    if (d > 0) { sum += d; cnt++; }
+    delay(10);
+  }
+
+  if (cnt == 0) return -1;
+  return sum / cnt;
+}
+
+// ================== IR / LINE ==================
+
+bool seesLine(int i) {
+  int v = digitalRead(sensorPins[i]);
+  return LINE_IS_LOW ? (v == LOW) : (v == HIGH);
+}
+
+int lineCount() {
+  int cnt = 0;
+  for (int i = 0; i < 8; i++) if (seesLine(i)) cnt++;
+  return cnt;
+}
+
+bool lineSeenStrong() {
+  return lineCount() >= LINE_STRONG_MIN;
+}
+
+void followLine() {
+  bool L = seesLine(0) || seesLine(1) || seesLine(2);
+  bool C = seesLine(3) || seesLine(4);
+  bool R = seesLine(5) || seesLine(6) || seesLine(7);
+
+  if (C && !L && !R) {
+    driveForwardAt(SPEED_STRAIGHT);
+    lastTurn = 0;
+  } else if (L && !R) {
+    turnLeft();
+    lastTurn = -1;
+  } else if (R && !L) {
+    turnRight();
+    lastTurn = +1;
+  } else if (L && C && R) {
+    driveForwardAt(SPEED_STRAIGHT);
+    lastTurn = 0;
+  } else {
+    if (lastTurn == -1) turnLeft();
+    else if (lastTurn == +1) turnRight();
+    else stopMotors();
+  }
+}
+
+// ================== MOTORY ==================
+
+void driveForwardAt(int spd) {
+  motorL.setSpeed(spd);
+  motorR.setSpeed(spd);
+  motorL.run(LEFT_REVERSED ? BACKWARD : FORWARD);
+  motorR.run(RIGHT_REVERSED ? BACKWARD : FORWARD);
+}
+
+void driveBackwardAt(int spd) {
+  motorL.setSpeed(spd);
+  motorR.setSpeed(spd);
+  motorL.run(LEFT_REVERSED ? FORWARD : BACKWARD);
+  motorR.run(RIGHT_REVERSED ? FORWARD : BACKWARD);
+}
+
+void spinInPlace(int dir, int spd) {
+  motorL.setSpeed(spd);
+  motorR.setSpeed(spd);
+
+  if (dir > 0) {
+    motorL.run(LEFT_REVERSED ? BACKWARD : FORWARD);
+    motorR.run(RIGHT_REVERSED ? FORWARD : BACKWARD);
+  } else {
+    motorL.run(LEFT_REVERSED ? FORWARD : BACKWARD);
+    motorR.run(RIGHT_REVERSED ? BACKWARD : FORWARD);
+  }
+}
+
+void turnLeft() {
+  motorL.setSpeed(SPEED_SLOW);
+  motorR.setSpeed(SPEED_TURN);
+  motorL.run(LEFT_REVERSED ? BACKWARD : FORWARD);
+  motorR.run(RIGHT_REVERSED ? BACKWARD : FORWARD);
+}
+
+void turnRight() {
+  motorL.setSpeed(SPEED_TURN);
+  motorR.setSpeed(SPEED_SLOW);
+  motorL.run(LEFT_REVERSED ? BACKWARD : FORWARD);
+  motorR.run(RIGHT_REVERSED ? BACKWARD : FORWARD);
+}
+
+void stopMotors() {
+  motorL.run(RELEASE);
+  motorR.run(RELEASE);
+}
